@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
 import types
 from transformers.generation import utils as generation_utils
 from transformers.utils import ModelOutput
-from transformers.cache_utils import Cache
 VERBOSE=False
 
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
