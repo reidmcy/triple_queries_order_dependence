@@ -139,7 +139,7 @@ def get_attention_mask_2d_n_options(tokA, tokMCQOptions, tokD, tokAll):
     mask=torch.tensor(mask.numpy())
     mask = mask.view(1,1,nTokAll,nTokAll)
     assert(mask.shape == (1,1,nTokAll,nTokAll))
-    return mask
+    return mask.to(torch.float32)
 
 # position_ids,tokB, tokC, tokAll, tokRev=get_position_ids_padded(tokA, tokB, tokC, tokD)
 # Get attention mask where tokens in tokC don't attend to tokens in tokB

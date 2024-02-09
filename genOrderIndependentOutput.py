@@ -57,5 +57,5 @@ def genOrderIndependentOutput(prefix, parallel_substrings, suffix, model, tokeni
     # Return output of model generation, and generated text
     return generated,text
 
-prefix,parallel_substrings,suffix="You are a gremlin who is ",["kind,","grisly,"]," How would you greet someone?"
-g,t=genOrderIndependentOutput(prefix, parallel_substrings, suffix, modelGPT, tokenizerGPT)
+#prefix,parallel_substrings,suffix="You are a gremlin who is ",["kind,","grisly,"]," How would you greet someone?"
+#g,t=genOrderIndependentOutput(prefix, parallel_substrings, suffix, modelGPT, tokenizerGPT)

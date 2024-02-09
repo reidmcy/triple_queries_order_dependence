@@ -149,7 +149,7 @@ def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_
 def get_2D_attention_accepting_model_gpt(model):
     model._update_model_kwargs_for_generation = types.MethodType(_update_model_kwargs_for_generation, model)
     model.prepare_inputs_for_generation = types.MethodType(prepare_inputs_for_generation, model)
-    for hidden_layer in range(len(modelGPT.transformer.h)):
+    for hidden_layer in range(len(model.transformer.h)):
         model.transformer.h[hidden_layer].attn._attn = types.MethodType(_attn, model.transformer.h[hidden_layer].attn)
     return model
 
