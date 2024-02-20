@@ -1,8 +1,9 @@
 import argparse
 import json
 from attention_mask_editing import *
-from genOrderIndependentOutput import *
+from gen_order_independent_output import *
 from config import HF_TOKEN
+import accelerate
 
 def load_csqa_prompts():
     with open('prompts_csqa.json', 'r') as f:
@@ -18,7 +19,7 @@ def load_csqa_order_independent_prompts():
         prefix=p.split("\n")[0]+"\n"
         parallel=p.split("\n- ")[1:]
         parallel=["\n- "+s for s in parallel]
-        prompts_parallel.append([prefix,parallel, " "])
+        prompts_parallel.append([prefix,parallel, " Answer: "])
     incorrect_answers=[]
     for p,label in zip(prompts,labels):
         options=p.split('\n- ')[1:]
@@ -32,7 +33,7 @@ def eval_accuracy(modelOutputs,labels,incorrect_answers):
             correct+=1
     print(f"{correct}/{len(modelOutputs)}={correct/len(modelOutputs)} answers correct")
     return correct/len(modelOutputs)
-def load_model(model_name):
+def load_model(model_name,torch_device="cpu"):
     if model_name=="gpt2":
         model = GPT2LMHeadModel.from_pretrained('gpt2')
         tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
@@ -40,29 +41,34 @@ def load_model(model_name):
     elif model_name=="llama":
         tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-chat-hf",use_auth_token=HF_TOKEN,use_fast=True)
         tokenizer.pad_token_id = tokenizer.eos_token_id
-        model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-chat-hf",use_auth_token=HF_TOKEN)
+        model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-chat-hf",use_auth_token=HF_TOKEN, device_map = torch_device)
     return model,tokenizer
-def get_model_outputs(model,tokenizer,prompts_parallel,is_order_independent,torch_device):
+def get_model_outputs(model,tokenizer,prompts_parallel,is_order_independent,torch_device,reverse_parallel_substrings_order):
     modelOutputs=[]
     for prefix,parallel_substrings,suffix in prompts_parallel:
-        g,t=genOrderIndependentOutput(prefix, parallel_substrings, suffix, model, tokenizer,is_order_independent=is_order_independent,torch_device=torch_device)
+        g,t=genOrderIndependentOutput(prefix, parallel_substrings, suffix, model, tokenizer,is_order_independent=is_order_independent,torch_device=torch_device,reverse_parallel_substrings_order=reverse_parallel_substrings_order)
         modelOutputs.append(t)
     return modelOutputs
 def save_model_outputs(modelOutputs,model_name,is_order_independent):
     suffix="_order_independent" if is_order_independent else ""
     with open(f"data/{model_name}_outputs{suffix}.json", 'w') as f:
         json.dump(modelOutputs, f)
-    
+
+def eval_model_csqa_accuracy(model, tokenizer, is_order_independent, torch_device, num_samples, model_name=None, reverse_parallel_substrings_order=False):
+    prompts_parallel,labels,incorrect_answers=load_csqa_order_independent_prompts()
+    modelOutputs=get_model_outputs(model,tokenizer,prompts_parallel[:num_samples],is_order_independent,torch_device,reverse_parallel_substrings_order)
+    eval_accuracy(modelOutputs,labels[:num_samples],incorrect_answers[:num_samples])
+    if model_name is None:
+        model_name=model.__class__
+    save_model_outputs(modelOutputs,model_name,is_order_independent)
+
 def main(model_name, is_order_independent, torch_device, num_samples):
     '''
     Save model outputs to file and report accuracy for a given model
     '''
     print(f"Generate model outputs for {num_samples} samples using model {model_name} on torch device {torch_device} with order independent={is_order_independent}")
-    model,tokenizer=load_model(model_name)
-    prompts_parallel,labels,incorrect_answers=load_csqa_order_independent_prompts()
-    modelOutputs=get_model_outputs(model,tokenizer,prompts_parallel[:num_samples],is_order_independent,torch_device)
-    eval_accuracy(modelOutputs,labels[:num_samples],incorrect_answers[:num_samples])
-    save_model_outputs(modelOutputs,model_name,is_order_independent)
+    model,tokenizer=load_model(model_name,torch_device)
+    eval_model_accuracy(model,tokenizer,is_order_independent,torch_device,num_samples, model_name)
 
 #  python evalCSQA.py --model-name gpt2 --torch-device cpu --num-samples 10
 #  python evalCSQA.py --model-name gpt2 --torch-device cpu --num-samples 10 --is-order-independent

@@ -1,6 +1,6 @@
 import torch
 from transformers import LlamaModel
-from transformers.models.llama.modeling_llama import _make_causal_mask, LlamaPreTrainedModel, rotate_half, repeat_kv
+from transformers.models.llama.modeling_llama import LlamaPreTrainedModel, rotate_half, repeat_kv, apply_rotary_pos_emb
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 import types
 from transformers.generation import utils as generation_utils
@@ -12,38 +12,8 @@ from transformers.cache_utils import Cache, DynamicCache
 from torch import nn
 import torch.nn.functional as F
 import math
-VERBOSE=True
+VERBOSE=False
 import warnings
-
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors.
-
-    Args:
-        q (`torch.Tensor`): The query tensor.
-        k (`torch.Tensor`): The key tensor.
-        cos (`torch.Tensor`): The cosine part of the rotary embedding.
-        sin (`torch.Tensor`): The sine part of the rotary embedding.
-        position_ids (`torch.Tensor`):
-            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
-            used to pass offsetted position ids when working with a KV-cache.
-        unsqueeze_dim (`int`, *optional*, defaults to 1):
-            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
-            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
-            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
-            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
-            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
-            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
-    Returns:
-        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
-    """
-    print(cos.shape,sin.shape)
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-    if VERBOSE:
-        print(f"apply_rotary_pos_embedding: cos={cos.shape},sin={sin.shape},position_ids={position_ids}")
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
 
 def forwardLlamaAttention(
         self,
@@ -61,7 +31,6 @@ def forwardLlamaAttention(
             )
 
         bsz, q_len, _ = hidden_states.size()
-
         if self.config.pretraining_tp > 1:
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
             query_slices = self.q_proj.weight.split(
@@ -97,8 +66,8 @@ def forwardLlamaAttention(
                     "with a layer index."
                 )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        cos, sin = self.rotary_emb(value_states, position_ids, seq_len=None)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, None)
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
@@ -200,10 +169,10 @@ def forwardLlamaModel(
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if self._use_flash_attention_2:
+        if False:#self._use_flash_attention_2:
             # 2d mask is passed through the layers
             attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-        elif self._use_sdpa and not output_attentions:
+        elif False:#self._use_sdpa and not output_attentions:
             # output_attentions=True can not be supported when using SDPA, and we fall back on
             # the manual implementation that requires a 4D causal mask in all cases.
             attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
@@ -217,8 +186,8 @@ def forwardLlamaModel(
             attention_mask = _prepare_4d_causal_attention_mask(
                 attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
             )
-            print(f"4D attention mask {attention_mask.shape}")
-            print(attention_mask)
+            if VERBOSE:
+                print(f"4D attention mask {attention_mask.shape}")
 
         # embed positions
         hidden_states = inputs_embeds
@@ -277,7 +246,7 @@ def forwardLlamaModel(
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
-def forward(
+def forwardLlamaForCausalLM(
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -291,8 +260,8 @@ def forward(
         return_dict: Optional[bool] = None,
     ):
         # NOTE: print debugging info
-        print(f"Position IDs={position_ids}")
-        print(attention_mask)
+        if VERBOSE:
+            print(f"Position IDs={position_ids}")
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -346,6 +315,28 @@ def forward(
             attentions=outputs.attentions,
         )
 
+def expand_attention_mask(attention_mask):
+    """
+    Expands an attention mask from shape (bsz, 1, tgt_seq_len, src_seq_len) to 
+    (bsz, 1, tgt_seq_len+1, src_seq_len+1) with the last new column as zeros and the last new row fully as ones.
+
+    Parameters:
+    - attention_mask: A torch.Tensor of shape (bsz, 1, tgt_seq_len, src_seq_len)
+
+    Returns:
+    - A torch.Tensor of shape (bsz, 1, tgt_seq_len+1, src_seq_len+1)
+    """
+    bsz, _, tgt_seq_len, src_seq_len = attention_mask.shape
+    new_attention_mask = torch.zeros(bsz, 1, tgt_seq_len+1, src_seq_len+1, device=attention_mask.device, dtype=torch.int32)
+
+    # Copy the existing attention mask to the new mask's top left
+    new_attention_mask[:, :, :tgt_seq_len, :src_seq_len] = attention_mask
+
+    # Set the last row fully to ones
+    new_attention_mask[:, :, -1, :] = 1
+
+    return new_attention_mask
+
 def _update_model_kwargs_for_generation(
         self,
         outputs: ModelOutput,
@@ -353,6 +344,8 @@ def _update_model_kwargs_for_generation(
         is_encoder_decoder: bool = False,
         standardize_cache_format: bool = False,
     ) -> Dict[str, Any]:
+        if VERBOSE:
+            print("_update_model_kwargs_for_generation")
         # update past_key_values
         model_kwargs["past_key_values"] = self._extract_past_from_model_output(
             outputs, standardize_cache_format=standardize_cache_format
@@ -370,30 +363,27 @@ def _update_model_kwargs_for_generation(
             if "attention_mask" in model_kwargs:
                 attention_mask = model_kwargs["attention_mask"]
                 if len(attention_mask.shape) == 4:
+                    next_position_id = model_kwargs["position_ids"][0][-1]+1 if "position_ids" in model_kwargs else attention_mask.shape[-1]
+                    
                     # given an attention_mask of shape (bsz, 1, tgt_seq_len, src_seq_len) in model kwargs, generate 
                     # new 2D attention_mask of ones with shape (bsz, src_seq_len+1) for subsequent forward() calls
-                    model_kwargs["attention_mask"] = torch.ones([attention_mask.shape[0], attention_mask.shape[-1]+1])
-                    next_position_id = model_kwargs["position_ids"][0][-1]+1 if "position_ids" in model_kwargs else attention_mask.shape[-1]
-                    model_kwargs["position_ids"] = torch.tensor([[next_position_id]])
-                    if VERBOSE:
-                        am=model_kwargs['attention_mask']
-                        print(f"2D attention mask shape={am.shape},{am.dtype}")
-                        print(attention_mask)
-                        print("After",am)
+                    model_kwargs["attention_mask"] = torch.ones([attention_mask.shape[0], attention_mask.shape[-1]+1]).to(attention_mask.device)
+                    model_kwargs["position_ids"] = torch.tensor([[next_position_id]]).to(model_kwargs["position_ids"].device)
+                    
+                    
+                    # Expand the attention mask to add a new column of zeros and a new column of ones--note this will also have the new token attend to any previous padding tokens?
+                    #model_kwargs["attention_mask"]=expand_attention_mask(model_kwargs["attention_mask"])
+                    #model_kwargs["position_ids"] = torch.cat((model_kwargs["position_ids"], torch.tensor([[next_position_id]]).to(model_kwargs["position_ids"].device)), dim=1)
+                    #model_kwargs["past_key_values"]=None
                 else:
                     # Extend the length of the attention mask by 1 to reflect the fact that we have generated one additional token
                     assert(len(attention_mask.shape) == 2)
                     model_kwargs["attention_mask"] = torch.cat(
                         [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
                     )
-                    
-                    next_position_id = model_kwargs["position_ids"][0][-1]+1 if "position_ids" in model_kwargs else attention_mask.shape[-1]
-                    model_kwargs["position_ids"] = torch.tensor([[next_position_id]])
-                    if VERBOSE:
-                        print(f"1D attention mask shape={model_kwargs['attention_mask'].shape}",model_kwargs['attention_mask'].dtype)
-            else:
-                if VERBOSE:
-                    print(f"attention_mask not in model_kwargs")
+                    if "position_ids" in model_kwargs:
+                        next_position_id = model_kwargs["position_ids"][0][-1]+1 if "position_ids" in model_kwargs else attention_mask.shape[-1]
+                        model_kwargs["position_ids"] = torch.tensor([[next_position_id]]).to(model_kwargs["position_ids"].device)
         else:
             # update decoder attention mask
             if "decoder_attention_mask" in model_kwargs:
@@ -404,16 +394,87 @@ def _update_model_kwargs_for_generation(
                 )
 
         return model_kwargs
+def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ):
+        # NOTE: the only change to this function relative to the current function version on github is that there is no cache_position keyword
+        if past_key_values is not None:
+            if isinstance(past_key_values, Cache):
+                cache_length = past_key_values.get_seq_length()
+                past_length = past_key_values.seen_tokens
+                max_cache_length = past_key_values.get_max_length()
+            else:
+                cache_length = past_length = past_key_values[0][0].shape[2]
+                max_cache_length = None
 
+            # Keep only the unprocessed tokens:
+            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
+            # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
+            # input)
+            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
+            # input_ids based on the past_length.
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
+            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
+
+            # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
+            if (
+                max_cache_length is not None
+                and attention_mask is not None
+                and cache_length + input_ids.shape[1] > max_cache_length
+            ):
+                attention_mask = attention_mask[:, -max_cache_length:]
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+            }
+        )
+        if VERBOSE:
+            print("prepare_inputs",model_inputs.keys(),attention_mask.shape,"past_key_values is None:",past_key_values is None,position_ids,kwargs.get("use_cache"))
+            print("Input IDs",input_ids)
+        return model_inputs
+
+# Used for transformers version git+https://github.com/huggingface/transformers@1c31b7aa3bb4e7ef24c77596d2a76f45a770159f
 def get_2D_attention_accepting_model_llama(model):
+    model._update_model_kwargs_for_generation = types.MethodType(_update_model_kwargs_for_generation, model)
+    return model
+
+'''
+# Used for transformers version git+https://github.com/huggingface/transformers@1e402b957d96597e5e47c06da5671ccec09621cc
+def get_2D_attention_accepting_model_llama(model):
+    # TODO: 2/17/2024 - determine minimal amount of edits required to obtain order independent behavior
     # Since llama2 already accepts 4D attention masks as input to forward(), we only need to override the _update_model_kwargs_for_generation() method to enable model.generate() to accept 4D attention masks as input as well.
     model._update_model_kwargs_for_generation = types.MethodType(_update_model_kwargs_for_generation, model)
+    model.prepare_inputs_for_generation=types.MethodType(prepare_inputs_for_generation, model)
     
-    # NOTE: the following two methods are only overridden for the sake of printing out deubbing information. Their behavior is not actually modified. 
-    model.forward = types.MethodType(forward, model)
+    # NOTE: the following two methods are only overridden for the sake of printing out debugging information. Their behavior is not actually modified. 
+    model.forward = types.MethodType(forwardLlamaForCausalLM, model)
     model.model.forward = types.MethodType(forwardLlamaModel, model.model)
-    print(f"Override attention")
+    # NOTE: we DO(?!) need to override LlamaAttention.forward() in order to get order independent output?!?!?
+    if VERBOSE:
+        print(f"Override attention7")
     for i in range(len(model.model.layers)):
         model.model.layers[i].self_attn.forward = types.MethodType(forwardLlamaAttention, model.model.layers[i].self_attn)
     return model
+'''
 # modelLlama=get_attention_accepting_model(modelLlama)
